@@ -33,6 +33,8 @@ Immich albums ──(search/metadata, download original)──▶ Amazon Drive v
 
 ## Setup
 
+> 🇩🇪 Step-by-step guide in German (Immich + Echo Show, Docker Compose): [docs/anleitung-de.md](docs/anleitung-de.md)
+
 ### 1. Build the image locally
 
 The image is built from this repository. Do not pull it from a third-party registry.
