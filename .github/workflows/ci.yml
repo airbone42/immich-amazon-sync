@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      # Actions are pinned by full commit SHA; update SHA and comment together.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Build image (no push)
+        run: docker build --pull -t immich-amazon-sync:ci .
+
+      - name: Image runs as non-root
+        run: test "$(docker run --rm --entrypoint id immich-amazon-sync:ci -u)" = "10001"
