@@ -19,17 +19,129 @@ Zeitaufwand beim ersten Mal: etwa 30 Minuten.
 - **Echo Show und Amazon Photos im selben Amazon-Konto (amazon.de).** Der Echo zeigt nur Alben des Kontos, mit dem er registriert ist.
 - Amazon Photos ist bei Prime unbegrenzt für Fotos. Videos zählen auf das Speicherkontingent, deshalb ist der Default `SYNC_TYPES=IMAGE`.
 
+## Schnellstart (Copy & Paste)
+
+Für einen Linux-Docker-Host mit `bash`, auf dem Immich per Docker Compose läuft. Die Blöcke nacheinander ins Terminal kopieren. Annahmen:
+- Das Immich-Album und das Amazon-Album heißen beide **„Echo Show“**.
+- Installiert wird nach `~/immich-amazon-sync`.
+
+Vorher erledigen:
+- Album und API-Key in Immich anlegen (Abschnitt 2).
+- Cookies und User-Agent aus dem Browser kopieren (Abschnitt 3).
+
+**1. Klonen und Image bauen**
+
+```bash
+cd ~ && git clone https://github.com/airbone42/immich-amazon-sync.git && cd immich-amazon-sync && docker build --pull -t immich-amazon-sync:local .
+```
+
+**2. Immich-Netz finden und Verbindung testen.** Ausgabe muss `"major":3` und `"minor"` ≥ 2 enthalten.
+
+```bash
+cd ~/immich-amazon-sync && NET=$(docker network ls --format '{{.Name}}' | grep -m1 immich) && echo "Immich-Netz: $NET" && docker run --rm --network "$NET" --entrypoint python3 immich-amazon-sync:local -c "import urllib.request; print(urllib.request.urlopen('http://immich-server:2283/api/server/version').read().decode())"
+```
+
+**3. Secrets eingeben.** Die Eingabe ist verdeckt; einfügen und Enter drücken.
+- `immich_api_key`: der Immich-API-Key
+- `ap_session_id`: Cookie `session-id`
+- `ap_ubid_value`: Cookie `ubid-acbde`
+- `ap_at_value`: Cookie `at-acbde`
+
+```bash
+cd ~/immich-amazon-sync && mkdir -p data secrets && chmod 700 secrets && for s in immich_api_key ap_session_id ap_ubid_value ap_at_value; do read -rsp "$s: " v; echo; printf '%s' "$v" > "secrets/$s"; done; unset v
+```
+
+**4. Rechte für den Container-User (UID 10001)**
+
+```bash
+cd ~/immich-amazon-sync && sudo chown 10001:10001 data secrets/* && sudo chmod 700 data && sudo chmod 400 secrets/*
+```
+
+**5. `.env` anlegen.** Fragt nach dem User-Agent deines Browsers.
+
+```bash
+cd ~/immich-amazon-sync && read -rp "User-Agent aus dem Browser: " UA && cat > .env <<EOF
+IMMICH_URL=http://immich-server:2283
+IMMICH_ALBUMS=Echo Show
+AP_TLD=de
+AP_ALBUM_NAME=Echo Show
+AP_DELETE_MODE=trash
+AP_USER_AGENT=$UA
+SYNC_TYPES=IMAGE
+MAX_FILE_MB=200
+SYNC_INTERVAL_HOURS=6
+MAX_DELETE_FRACTION=0.2
+MAX_DELETE_COUNT=50
+EOF
+chmod 600 .env
+```
+
+**6. `compose.yml` anlegen.** Das Immich-Netz wird automatisch eingetragen.
+
+```bash
+cd ~/immich-amazon-sync && NET=$(docker network ls --format '{{.Name}}' | grep -m1 immich) && cat > compose.yml <<EOF
+services:
+  immich-sync:
+    image: immich-amazon-sync:local
+    container_name: immich-sync
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      IMMICH_API_KEY_FILE: /run/secrets/immich_api_key
+      AP_SESSION_ID_FILE: /run/secrets/ap_session_id
+      AP_UBID_VALUE_FILE: /run/secrets/ap_ubid_value
+      AP_AT_VALUE_FILE: /run/secrets/ap_at_value
+    secrets: [immich_api_key, ap_session_id, ap_ubid_value, ap_at_value]
+    volumes:
+      - ./data:/data
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [immich]
+
+secrets:
+  immich_api_key: { file: ./secrets/immich_api_key }
+  ap_session_id:  { file: ./secrets/ap_session_id }
+  ap_ubid_value:  { file: ./secrets/ap_ubid_value }
+  ap_at_value:    { file: ./secrets/ap_at_value }
+
+networks:
+  immich:
+    external: true
+    name: $NET
+EOF
+```
+
+**7. Dry-Run.** Schreibt nichts; zeigt, was hochgeladen würde.
+
+```bash
+cd ~/immich-amazon-sync && docker compose run --rm -e DRY_RUN=true -e RUN_ONCE=true immich-sync
+```
+
+**8. Erster echter Lauf.** Danach das Album unter amazon.de/photos prüfen.
+
+```bash
+cd ~/immich-amazon-sync && docker compose run --rm -e RUN_ONCE=true immich-sync
+```
+
+**9. Dauerbetrieb starten.** Synchronisiert alle 6 Stunden.
+
+```bash
+cd ~/immich-amazon-sync && docker compose up -d && docker logs -f immich-sync
+```
+
+Zum Schluss den Echo Show auf das Album stellen (Abschnitt 9). Die folgenden Abschnitte erklären die einzelnen Schritte ausführlich.
+
 ## 1. Code holen und Image bauen
 
 Auf dem Docker-Host:
 
 ```bash
-git clone -b de-album-sync https://github.com/airbone42/immich-amazon-sync.git
+git clone https://github.com/airbone42/immich-amazon-sync.git
 cd immich-amazon-sync
 docker build --pull -t immich-amazon-sync:local .
 ```
-
-Sobald der PR in `main` gemergt ist, reicht `git clone` ohne `-b`.
 
 ## 2. Immich vorbereiten
 
