@@ -62,7 +62,7 @@ In Immich, go to **Account Settings → API Keys → New API Key**. Do not grant
 ### 3. Get the Amazon Photos cookies (amazon.de)
 
 1. Log in to <https://www.amazon.de/photos> in your browser.
-2. Open DevTools (F12) → **Application** (Chrome) / **Storage** (Firefox) → **Cookies** → `https://www.amazon.de`.
+2. Open DevTools (F12) → **Application** (Chrome/Edge) / **Storage** (Firefox) → **Cookies** → `https://www.amazon.de`. This list includes `HttpOnly` cookies.
 3. Copy these three values:
 
    | Cookie       | Variable        |
@@ -73,11 +73,21 @@ In Immich, go to **Account Settings → API Keys → New API Key**. Do not grant
 
 4. Optionally copy your browser's User-Agent (DevTools → Network → any request → `User-Agent`) into `AP_USER_AGENT`.
 
-> **Note:** `at-acbde` is `HttpOnly` and may not appear in the cookie list. In that case open **Network** → any request to `amazon.de` → **Request Headers** → `Cookie`, and copy the value after `at-acbde=`.
+> **Note:** If `at-acbde` is missing from the cookie list, open **Network** → reload → any request to `www.amazon.de` → **Request Headers** → `cookie`, and copy the value after `at-acbde=` up to the next `;`.
+>
+> Do not log out of Amazon in that browser afterwards: logging out invalidates the cookies. Closing the browser is fine.
 
 The cookies expire after a few weeks or months. When they do, every run stops at the first Amazon request with `cookies expired or invalid` (exit code 3). Copy fresh values and restart.
 
 Other regions: set `AP_TLD` (for example `com`, `co.uk`, `fr`). Cookie names follow the pattern `ubid-acb<country>` / `at-acb<country>`, and `ubid-main` / `at-main` for amazon.com. The upload host is known for North America (`com`, `ca`) and EU marketplaces. For anything else, set `AP_CONTENT_URL`.
+
+`IMMICH_URL` can point at the Immich container through a shared Docker network (`http://immich-server:2283`, see the German guide), or at a hostname or IP (`http://immich.local:2283`). A hostname that exists only in the host's `/etc/hosts` cannot be resolved by Docker. Use the IP in that case.
+
+#### Using an existing Amazon Photos album
+
+`AP_ALBUM_NAME` can name an album that already exists. It is matched by exact name, case-sensitive. The dry run logs `Amazon Photos album '<name>': <id>`. The ID must match the end of the album URL `https://www.amazon.<tld>/photos/album/<id>`. If the log shows `Would create` instead, the album was not found.
+
+Photos that are already in the album are never touched. Only photos this tool added are removed again.
 
 ### 4. Configure
 
@@ -125,6 +135,8 @@ View logs:
 ```bash
 docker logs -f immich-sync
 ```
+
+With `--restart unless-stopped` (or `restart: unless-stopped` in Compose), the container comes back after a host reboot, as long as the Docker service starts at boot and the container wasn't stopped by hand. The first sync runs right after start. If Immich comes up later, that run fails without deleting anything, and the next attempt follows after `SYNC_INTERVAL_HOURS`.
 
 Force a sync now:
 
@@ -221,6 +233,8 @@ Otherwise nothing is deleted, an error is logged and the exit code is 2. An empt
 With small albums the fraction limit trips quickly (for example, removing 1 of 4 photos is 25%). To deliberately delete more, raise `MAX_DELETE_FRACTION` / `MAX_DELETE_COUNT` for one run. Ideally do a dry run first.
 
 Changing `SYNC_TYPES` does not delete anything: only assets that left all Immich albums are removed.
+
+**Albums that change completely and often** (for example refilled daily by a script) trip the brake on every run, and old photos stay in the Amazon album. Raise the limits permanently, e.g. `MAX_DELETE_FRACTION=1` and `MAX_DELETE_COUNT=500`. Incomplete Immich data still blocks deletions. However, if the automation briefly empties the album and a sync runs at exactly that moment, the Amazon album is emptied as well. Everything is uploaded again on the next run.
 
 ## State
 

@@ -133,6 +133,28 @@ cd ~/immich-amazon-sync && docker compose up -d && docker logs -f immich-sync
 
 Zum Schluss den Echo Show auf das Album stellen (Abschnitt 9). Die folgenden Abschnitte erklären die einzelnen Schritte ausführlich.
 
+### Variante: Immich per Hostname oder IP
+
+Läuft Immich auf einem anderen Rechner oder soll der Sync-Container nicht ins Docker-Netz von Immich, sprichst du Immich direkt an. `immich.local` steht hier für deinen Hostnamen oder die IP.
+
+Statt Schritt 2:
+
+```bash
+docker run --rm --entrypoint python3 immich-amazon-sync:local -c "import urllib.request; print(urllib.request.urlopen('http://immich.local:2283/api/server/version').read().decode())"
+```
+
+In Schritt 5 die Zeile `IMMICH_URL=http://immich.local:2283` verwenden. In Schritt 6 die Zeile `networks: [immich]` und den ganzen Block `networks:` am Ende weglassen.
+
+Meldet der Test `Name or service not known`, kann Docker den Namen nicht auflösen. Das passiert, wenn er nur in der `/etc/hosts` des Hosts steht. Dann die IP verwenden.
+
+### Variante: bestehendes Amazon-Album
+
+`AP_ALBUM_NAME` darf ein Album sein, das es in Amazon Photos schon gibt. Der Name muss exakt stimmen, inklusive Groß-/Kleinschreibung.
+
+Im Dry-Run steht dann `Amazon Photos album '<Name>': <ID>`. Die ID muss mit dem Ende der Album-Adresse übereinstimmen: `https://www.amazon.de/photos/album/<ID>`. Steht dort `Would create`, wurde das Album nicht gefunden.
+
+Fotos, die schon im Album liegen, fasst das Tool nicht an. Es entfernt nur Fotos, die es selbst hinzugefügt hat.
+
 ## 1. Code holen und Image bauen
 
 Auf dem Docker-Host:
@@ -166,22 +188,28 @@ Den Schlüssel kopieren, er wird nur einmal angezeigt.
 Das Tool meldet sich mit den Cookies deines Browsers bei Amazon an, ein offizielles API gibt es nicht.
 
 1. Am Desktop-Browser (Chrome/Edge/Firefox) auf <https://www.amazon.de/photos> einloggen. Dabei **„Angemeldet bleiben“** anhaken.
-2. **F12** → Reiter **Netzwerk** (Network) → Seite neu laden (F5).
-3. Eine beliebige Anfrage an `www.amazon.de` anklicken → **Anforderungsheader** (Request Headers) → Zeile `Cookie`.
-4. Aus dieser Zeile drei Werte heraussuchen, jeweils der Teil nach `=` bis zum nächsten `;`:
+2. **F12** drücken. Reiter **Anwendung** (Chrome/Edge, engl. *Application*) bzw. **Web-Speicher** (Firefox, engl. *Storage*) öffnen. Falls der Reiter nicht zu sehen ist: `»`.
+3. Links **Speicher → Cookies → `https://www.amazon.de`** anklicken.
+4. Im Filterfeld nach dem Namen suchen und den Wert aus der Spalte **Wert** (*Value*) kopieren: Doppelklick, Strg+A, Strg+C.
 
-   | Cookie | Datei (Schritt 4) |
-   |---|---|
-   | `session-id` | `secrets/ap_session_id` |
-   | `ubid-acbde` | `secrets/ap_ubid_value` |
-   | `at-acbde` | `secrets/ap_at_value` (beginnt meist mit `Atza|`) |
+   | Cookie | Wird abgefragt als | Sieht ungefähr so aus |
+   |---|---|---|
+   | `session-id` | `ap_session_id` | `262-1234567-1234567` |
+   | `ubid-acbde` | `ap_ubid_value` | `260-1234567-1234567` |
+   | `at-acbde` | `ap_at_value` | langer Text, beginnt meist mit `Atza|` (vollständig kopieren) |
 
-5. Unter **Netzwerk** steht in derselben Anfrage auch `User-Agent`. Den kopierst du für `AP_USER_AGENT`.
+5. Den **User-Agent** findest du so:
+   1. Reiter **Netzwerk** (*Network*) öffnen und die Seite mit F5 neu laden.
+   2. Eine Anfrage an `www.amazon.de` anklicken → **Anforderungsheader** (*Request Headers*) → Zeile `user-agent`.
+
+   Den Wert kopierst du für `AP_USER_AGENT`.
+
+Fehlt `at-acbde` in der Cookie-Tabelle: Im selben Anforderungsheader steht die Zeile `cookie`. Darin den Teil nach `at-acbde=` bis vor das nächste `;` kopieren.
 
 Wichtig:
-- **Dich danach in diesem Browser nicht bei Amazon abmelden.** Abmelden macht die Cookies ungültig.
-- Die Cookies sind Zugangsdaten zu deinem Amazon-Konto. Behandle sie wie ein Passwort.
-- Sie laufen nach einigen Wochen bis Monaten ab. Dann diesen Schritt wiederholen (siehe Abschnitt 9).
+- **Dich danach in diesem Browser nicht bei Amazon abmelden.** Abmelden macht die Cookies ungültig. Den Browser schließen ist okay.
+- Die Cookies sind Zugangsdaten zu deinem Amazon-Konto. Behandle sie wie ein Passwort und schick sie nicht per Chat oder Mail.
+- Sie laufen nach einigen Wochen bis Monaten ab. Dann diesen Schritt wiederholen (siehe Abschnitt 10).
 
 ## 4. Konfiguration anlegen
 
@@ -347,13 +375,20 @@ Neue Fotos erscheinen auf dem Echo, nachdem der nächste Sync gelaufen ist und d
 ## 10. Alltag
 
 - **Foto hinzufügen:** In Immich ins Album legen. Es erscheint nach dem nächsten Sync.
-- **Foto entfernen:** In Immich aus dem Album nehmen. Beim nächsten Sync wird es aus dem Amazon-Album entfernt und in den Amazon-Papierkorb verschoben.
+- **Foto entfernen:** In Immich aus dem Album nehmen. Beim nächsten Sync wird es aus dem Amazon-Album entfernt und in den Amazon-Papierkorb verschoben. Das Amazon-Album hat damit immer denselben Inhalt wie das Immich-Album, es sammelt sich nichts an.
   - Mit `AP_DELETE_MODE=album_only` bleibt es stattdessen in der Amazon-Bibliothek.
   - Fotos, die schon vorher in Amazon Photos lagen (z. B. aus der Handy-Sicherung), werden nie in den Papierkorb verschoben, nur aus dem Album genommen.
+  - Fotos, die schon vor dem ersten Sync im Amazon-Album waren, fasst das Tool nicht an. Die einmal von Hand entfernen.
 - **Löschbremse:** Würden in einem Lauf mehr als 20 % oder mehr als 50 der Fotos gelöscht, löscht das Tool gar nichts und meldet `Deletion brake` (Exit-Code 2). Bei kleinen Alben passiert das schnell: 1 von 4 Fotos sind schon 25 %. Wenn das Absicht war, einmalig mit höherer Grenze laufen lassen:
   ```bash
   docker compose run --rm -e RUN_ONCE=true -e MAX_DELETE_FRACTION=1 immich-sync
   ```
+- **Album, das sich oft komplett ändert** (z. B. täglich neu befüllt per Skript oder Automatisierung): Die Löschbremse würde dann jeden Tag greifen, und die alten Fotos blieben drin. Grenzen dauerhaft hochsetzen:
+  ```bash
+  cd ~/immich-amazon-sync && sed -i 's/^MAX_DELETE_FRACTION=.*/MAX_DELETE_FRACTION=1/; s/^MAX_DELETE_COUNT=.*/MAX_DELETE_COUNT=500/' .env && docker compose up -d --force-recreate
+  ```
+  Ein unvollständiger Datenstand aus Immich löscht auch dann nichts: kein Album gefunden, Abfrage fehlgeschlagen oder Anzahl stimmt nicht. Leert die Automatisierung das Album aber kurz komplett und der Sync läuft genau dann, wird auch das Amazon-Album geleert. Beim nächsten Lauf wird alles wieder hochgeladen.
+- **Neustart des Docker-Hosts:** Dank `restart: unless-stopped` startet der Container automatisch wieder, sofern Docker beim Booten startet (`systemctl is-enabled docker containerd` sollte zweimal `enabled` ausgeben) und du ihn nicht vorher selbst gestoppt hast. Nach dem Start synchronisiert er sofort. Startet Immich langsamer, schlägt dieser erste Lauf fehl, ohne etwas zu löschen. Der nächste Versuch kommt nach `SYNC_INTERVAL_HOURS`, oder sofort per `docker restart immich-sync`.
 - **Cookies abgelaufen:** Im Log steht `cookies expired or invalid`, Exit-Code 3. Dann:
   1. Schritt 3 wiederholen.
   2. Die drei Dateien in `secrets/` überschreiben. Sie gehören jetzt UID 10001, also mit `sudo`, z. B.:
