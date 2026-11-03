@@ -77,7 +77,29 @@ In Immich, go to **Account Settings → API Keys → New API Key**. Do not grant
 >
 > Do not log out of Amazon in that browser afterwards: logging out invalidates the cookies. Closing the browser is fine.
 
-The cookies expire after a few weeks or months. When they do, every run stops at the first Amazon request with `cookies expired or invalid` (exit code 3). Copy fresh values and restart.
+The cookies expire, sometimes after weeks, sometimes after a day or two: the browser rotates `at-acbde` together with `x-acbde` and `session-token`, and the copy the sync holds becomes invalid. When that happens, every run stops at the first Amazon request with `cookies expired or invalid` (exit code 3). Copy fresh values and restart, or use the device login below.
+
+### 3b. Device login instead of cookies (optional)
+
+Instead of copying cookies, the sync can register itself once as a device of your Amazon account, the way Amazon's mobile apps sign in (OAuth with PKCE). That yields a refresh token that stays valid until the device is removed from the account. At the start of every run the sync trades it for a fresh set of website cookies, so nothing has to be copied again.
+
+With the container running:
+
+```bash
+docker exec -it immich-sync python3 /app/immich_sync.py amazon-login
+```
+
+1. Open the printed address in a browser (a private window is fine) and sign in, including the second factor.
+2. Amazon ends on an error page ("page not found") at `https://www.amazon.de/ap/maplanding?...`. That is expected: copy the complete address from the address bar.
+3. Paste it at the hidden prompt. The tool registers the device, checks access to Amazon Photos and writes `data/amazon_device.json` (mode `0600`). If Amazon Photos does not accept the new session, it removes the device again and saves nothing.
+4. `docker restart immich-sync` starts a run right away.
+
+While `data/amazon_device.json` exists, the cookie variables are not needed and are ignored. Your password never reaches the tool, only the one-time authorization code from the address.
+
+- The registration follows the "external login" of the [audible](https://github.com/mkb79/Audible) library and registers as the Audible iOS app. The device appears in your account under **Manage Content and Devices → Devices** as "<first name>'s Audible for iPhone".
+- The refresh token gives full access to the Amazon account, like the cookies do. Keep `data/` private.
+- To stop: `docker exec immich-sync python3 /app/immich_sync.py amazon-logout` removes the device from the account and deletes the file, or remove the device in the account (the next run then exits with code 3).
+- Available for `AP_TLD` `de`, `com`, `co.uk`, `fr`, `it`, `es` and `ca`.
 
 Other regions: set `AP_TLD` (for example `com`, `co.uk`, `fr`). Cookie names follow the pattern `ubid-acb<country>` / `at-acb<country>`, and `ubid-main` / `at-main` for amazon.com. The upload host is known for North America (`com`, `ca`) and EU marketplaces. For anything else, set `AP_CONTENT_URL`.
 
@@ -191,7 +213,7 @@ Without Swarm, Compose bind-mounts the secret files, so they must be readable by
 | `IMMICH_ALBUMS` | Comma-separated Immich album names (exact match, must be unique) | - |
 | `AP_ALBUM_NAME` | Target album in Amazon Photos (created if missing) | - |
 | `AP_TLD` | Amazon marketplace TLD (`de`, `com`, `co.uk`, …) | `de` |
-| `AP_SESSION_ID` | `session-id` cookie | - |
+| `AP_SESSION_ID` | `session-id` cookie (not needed with the device login) | - |
 | `AP_UBID_VALUE` | `ubid-acbde` cookie (or the regional equivalent) | - |
 | `AP_AT_VALUE` | `at-acbde` cookie (or the regional equivalent) | - |
 | `AP_UBID_KEY` / `AP_AT_KEY` | Override the cookie names derived from `AP_TLD` | derived |
@@ -217,7 +239,7 @@ Every variable can also be read from a file via `<NAME>_FILE`.
 | 0 | Success (the healthcheck is pinged) |
 | 1 | Errors: config problem, Immich unreachable or too old, album not found, individual uploads failed, `assetCount` mismatch |
 | 2 | Planned deletions were **not** executed (deletion brake or incomplete Immich data) |
-| 3 | Amazon answered 401/403 or redirected to the sign-in page, so the cookies have expired. The run was aborted. |
+| 3 | Amazon answered 401/403 or redirected to the sign-in page, so the cookies have expired (or, with the device login, the device was removed from the account). The run was aborted. |
 
 ## Deletion safety
 
@@ -260,7 +282,7 @@ Changing `SYNC_TYPES` does not delete anything: only assets that left all Immich
 
 ## Limitations
 
-- **Cookie auth is fragile.** Cookies expire and must be refreshed by hand. There is no OAuth or API key flow.
+- **Cookie auth is fragile.** Cookies expire and must be refreshed by hand. The device login (section 3b) avoids that, but it relies on Amazon's undocumented app registration and can break like the rest of the API.
 - **Undocumented API.** Endpoints and request shapes come from the browser app and the [`amazon-photos`](https://github.com/trevorhobenshield/amazon_photos) library, not from official documentation.
 - **Files land in the root folder.** They are then added to the album. An album is not a folder, so there is no way to upload into it directly.
 - **Deduplication is by Immich asset ID.** On a 409 conflict, the existing Amazon node is adopted only if its MD5 matches. Otherwise the file is uploaded again under `<name>_<assetid8>.<ext>`.

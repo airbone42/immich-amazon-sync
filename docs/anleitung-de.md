@@ -209,7 +209,28 @@ Fehlt `at-acbde` in der Cookie-Tabelle: Im selben Anforderungsheader steht die Z
 Wichtig:
 - **Dich danach in diesem Browser nicht bei Amazon abmelden.** Abmelden macht die Cookies ungültig. Den Browser schließen ist okay.
 - Die Cookies sind Zugangsdaten zu deinem Amazon-Konto. Behandle sie wie ein Passwort und schick sie nicht per Chat oder Mail.
-- Sie laufen nach einigen Wochen bis Monaten ab. Dann diesen Schritt wiederholen (siehe Abschnitt 10).
+- Sie laufen ab, manchmal nach Wochen, manchmal schon nach ein, zwei Tagen: Der Browser tauscht `at-acbde` zusammen mit `x-acbde` und `session-token` regelmäßig aus, dabei wird die Kopie des Tools ungültig. Dann diesen Schritt wiederholen (siehe Abschnitt 10) oder auf die Geräte-Anmeldung umstellen (Abschnitt 3b).
+
+## 3b. Geräte-Anmeldung statt Cookies (optional)
+
+Statt Cookies zu kopieren, kann sich das Tool einmal als Gerät deines Amazon-Kontos anmelden, so wie es die Amazon-Apps tun. Es bekommt dabei ein Refresh-Token, das gilt, bis das Gerät im Konto entfernt wird. Vor jedem Lauf tauscht es das Token gegen frische Cookies. Kopieren musst du danach nichts mehr. Dein Passwort sieht das Tool nie, nur einen einmaligen Code aus der Adresszeile.
+
+Wenn der Container läuft (Schritt 7):
+
+```bash
+docker exec -it immich-sync python3 /app/immich_sync.py amazon-login
+```
+
+1. Die angezeigte Adresse im Browser öffnen (privates Fenster geht) und mit dem Amazon-Konto des Echo Show anmelden, auch mit dem zweiten Faktor.
+2. Amazon landet danach auf einer Fehlerseite („Seite nicht gefunden“) unter `https://www.amazon.de/ap/maplanding?...`. Das ist richtig so. Die **ganze Adresse** aus der Adresszeile kopieren.
+3. Im Terminal einfügen (die Eingabe bleibt unsichtbar) und Enter drücken. Der Code darin gilt nur wenige Minuten. Das Tool registriert das Gerät, prüft den Zugriff auf Amazon Photos und speichert `data/amazon_device.json` (Rechte `0600`). Klappt der Zugriff nicht, meldet es das Gerät wieder ab und speichert nichts.
+4. `docker restart immich-sync` startet gleich einen Lauf. Im Log steht dann `fresh cookies from the device login`.
+
+Solange `data/amazon_device.json` existiert, nutzt das Tool die Cookie-Dateien in `secrets/` nicht.
+
+- Das Gerät erscheint im Amazon-Konto unter **Inhalte und Geräte → Geräte** als „<Vorname>s Audible for iPhone“. Das Tool meldet sich nach dem Vorbild der Bibliothek [audible](https://github.com/mkb79/Audible) als Audible-App an. Auf Audible greift es nicht zu.
+- Das Refresh-Token ist ein Zugang zum ganzen Amazon-Konto, wie die Cookies auch. `data/` nicht weitergeben.
+- Abmelden: `docker exec immich-sync python3 /app/immich_sync.py amazon-logout` entfernt das Gerät im Konto und löscht die Datei. Oder das Gerät im Konto entfernen, dann endet der nächste Lauf mit Exit-Code 3.
 
 ## 4. Konfiguration anlegen
 
@@ -332,7 +353,8 @@ Typische Fehler:
 | `HTTP Error 401` bei Immich | API-Key falsch oder ohne die drei Berechtigungen |
 | `HTTP Error 403` bei Immich | API-Key fehlt eine der drei Berechtigungen |
 | `Name or service not known` / `Connection refused` | `IMMICH_URL` oder Netzwerkname in `compose.yml` prüfen |
-| `cookies expired or invalid` (Exit-Code 3) | Cookies falsch kopiert oder abgelaufen → Schritt 3 wiederholen |
+| `cookies expired or invalid` (Exit-Code 3) | Cookies falsch kopiert oder abgelaufen → Schritt 3 wiederholen oder Geräte-Anmeldung (3b) |
+| `device login expired or removed` (Exit-Code 3) | Gerät im Amazon-Konto entfernt → `amazon-login` wiederholen (3b) |
 | `Permission denied` auf `/data` oder `/run/secrets/...` | `chown 10001:10001` aus Schritt 4 vergessen |
 
 ## 7. Erster echter Lauf
@@ -389,7 +411,7 @@ Neue Fotos erscheinen auf dem Echo, nachdem der nächste Sync gelaufen ist und d
   ```
   Ein unvollständiger Datenstand aus Immich löscht auch dann nichts: kein Album gefunden, Abfrage fehlgeschlagen oder Anzahl stimmt nicht. Leert die Automatisierung das Album aber kurz komplett und der Sync läuft genau dann, wird auch das Amazon-Album geleert. Beim nächsten Lauf wird alles wieder hochgeladen.
 - **Neustart des Docker-Hosts:** Dank `restart: unless-stopped` startet der Container automatisch wieder, sofern Docker beim Booten startet (`systemctl is-enabled docker containerd` sollte zweimal `enabled` ausgeben) und du ihn nicht vorher selbst gestoppt hast. Nach dem Start synchronisiert er sofort. Startet Immich langsamer, schlägt dieser erste Lauf fehl, ohne etwas zu löschen. Der nächste Versuch kommt nach `SYNC_INTERVAL_HOURS`, oder sofort per `docker restart immich-sync`.
-- **Cookies abgelaufen:** Im Log steht `cookies expired or invalid`, Exit-Code 3. Dann:
+- **Cookies abgelaufen:** Im Log steht `cookies expired or invalid`, Exit-Code 3. Dauerhaft hilft die Geräte-Anmeldung (Abschnitt 3b). Sonst:
   1. Schritt 3 wiederholen.
   2. Die drei Dateien in `secrets/` überschreiben. Sie gehören jetzt UID 10001, also mit `sudo`, z. B.:
      ```bash

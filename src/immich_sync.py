@@ -14,8 +14,12 @@ Features:
   - Deduplication: skips assets already synced (by ID); upload conflicts are
     resolved by MD5 so existing Amazon nodes are adopted, not duplicated
   - Region aware: amazon.de by default, any TLD via AP_TLD
+  - Device login (optional): register once as a device of the Amazon account and
+    get fresh cookies before every run, instead of copying browser cookies
 """
 
+import base64
+import getpass
 import gzip
 import hashlib
 import json
@@ -28,9 +32,10 @@ import re
 import sys
 import tempfile
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, install_opener, urlopen
 
 # Constants
@@ -87,6 +92,9 @@ SYNC_TYPES: set[str] = {"IMAGE"}
 HEALTHCHECK_URL: str = ""
 STATE_DIR: Path = Path("/data")
 STATE_FILE: Path = Path("/data/state.json")
+AMAZON_TLD: str = "de"
+DEVICE_FILE: Path = Path("/data/amazon_device.json")
+AUTH_MODE: str = "cookies"  # "cookies" (copied from the browser) or "device" (device login)
 
 # Values that must never show up in logs (see _RedactingFormatter)
 _SECRETS: set[str] = set()
@@ -116,7 +124,7 @@ class AmazonError(Exception):
 
 
 class AmazonAuthError(AmazonError):
-    """401/403 from Amazon - cookies expired or invalid."""
+    """401/403 from Amazon - cookies expired or invalid, or the device login was revoked."""
 
 
 # Configuration
@@ -198,6 +206,7 @@ def region_settings(tld: str) -> dict[str, str | None]:
     else:
         content_url = None
     return {
+        "tld": tld,
         "drive_url": f"https://www.amazon.{tld}/drive/v1",
         "content_url": content_url,
         "ubid_key": f"ubid-{suffix}",
@@ -210,7 +219,7 @@ def _configure() -> None:
     global IMMICH_URL, ALBUMS_TO_SYNC, AP_HEADERS, IMMICH_HEADERS
     global AMAZON_DRIVE_URL, AMAZON_CONTENT_URL, AP_ALBUM_NAME, DELETE_MODE, DRY_RUN
     global MAX_DELETE_FRACTION, MAX_DELETE_COUNT, MAX_FILE_BYTES, SYNC_TYPES
-    global HEALTHCHECK_URL, STATE_DIR, STATE_FILE
+    global HEALTHCHECK_URL, STATE_DIR, STATE_FILE, AMAZON_TLD, DEVICE_FILE, AUTH_MODE
 
     _SECRETS.clear()
 
@@ -223,6 +232,7 @@ def _configure() -> None:
         raise ConfigError("IMMICH_ALBUMS does not contain any album name")
 
     region = region_settings(_env("AP_TLD", "de"))
+    AMAZON_TLD = region["tld"]
     AMAZON_DRIVE_URL = region["drive_url"]
     content_override = _env("AP_CONTENT_URL")
     if content_override:
@@ -235,24 +245,37 @@ def _configure() -> None:
             f"no known upload host for AP_TLD={_env('AP_TLD')}; set AP_CONTENT_URL"
         )
 
-    ubid_key = _env("AP_UBID_KEY", region["ubid_key"])
-    at_key = _env("AP_AT_KEY", region["at_key"])
-    for key_name, key in (("AP_UBID_KEY", ubid_key), ("AP_AT_KEY", at_key)):
-        if not re.fullmatch(r"[A-Za-z0-9_-]+", key):
-            raise ConfigError(f"{key_name} is not a valid cookie name")
+    STATE_DIR = Path(_env("STATE_DIR", "/data"))
+    STATE_FILE = STATE_DIR / "state.json"
+    DEVICE_FILE = STATE_DIR / DEVICE_FILE_NAME
 
-    session_id = _secret("AP_SESSION_ID")
-    ubid_value = _secret("AP_UBID_VALUE")
-    at_value = _secret("AP_AT_VALUE")
     user_agent = _env("AP_USER_AGENT", DEFAULT_USER_AGENT)
     if not user_agent.isprintable():
         raise ConfigError("AP_USER_AGENT contains control characters")
+    AP_HEADERS = {"User-Agent": user_agent}
 
-    AP_HEADERS = {
-        "Cookie": f"session-id={session_id}; {ubid_key}={ubid_value}; {at_key}={at_value}",
-        "x-amzn-sessionid": session_id,
-        "User-Agent": user_agent,
-    }
+    if DEVICE_FILE.exists():
+        # device login: the cookies are fetched fresh at the start of every run
+        AUTH_MODE = "device"
+        device = load_device(DEVICE_FILE)
+        if device["tld"] != AMAZON_TLD:
+            raise ConfigError(
+                f"{DEVICE_FILE} belongs to amazon.{device['tld']}, but AP_TLD is {AMAZON_TLD}"
+            )
+    else:
+        AUTH_MODE = "cookies"
+        ubid_key = _env("AP_UBID_KEY", region["ubid_key"])
+        at_key = _env("AP_AT_KEY", region["at_key"])
+        for key_name, key in (("AP_UBID_KEY", ubid_key), ("AP_AT_KEY", at_key)):
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", key):
+                raise ConfigError(f"{key_name} is not a valid cookie name")
+        session_id = _secret("AP_SESSION_ID")
+        ubid_value = _secret("AP_UBID_VALUE")
+        at_value = _secret("AP_AT_VALUE")
+        AP_HEADERS.update({
+            "Cookie": f"session-id={session_id}; {ubid_key}={ubid_value}; {at_key}={at_value}",
+            "x-amzn-sessionid": session_id,
+        })
     IMMICH_HEADERS = {"x-api-key": immich_api_key, "Accept": "application/json"}
 
     AP_ALBUM_NAME = _require_env("AP_ALBUM_NAME").strip()
@@ -273,9 +296,6 @@ def _configure() -> None:
     if HEALTHCHECK_URL:
         HEALTHCHECK_URL = _http_url("HEALTHCHECK_URL", HEALTHCHECK_URL)
         _SECRETS.add(HEALTHCHECK_URL)  # ping URLs usually embed a token
-
-    STATE_DIR = Path(_env("STATE_DIR", "/data"))
-    STATE_FILE = STATE_DIR / "state.json"
 
 
 # Logging
@@ -758,6 +778,427 @@ def find_existing_node(conflict_body: str, name: str, md5: str, root_id: str) ->
     return None
 
 
+# Amazon device login
+#
+# Browser cookies die as soon as the browser (or Amazon) rotates the session: at-acbde is
+# replaced together with x-acbde/session-token, and the copy the sync holds becomes invalid,
+# sometimes after minutes, sometimes after days. Instead, the sync can register itself once as
+# a device of the Amazon account, the way Amazon's mobile apps sign in (OAuth with PKCE, then
+# /auth/register). That yields a refresh token which stays valid until the device is removed
+# from the account. At the start of every run the sync trades it for a fresh set of ordinary
+# amazon.<tld> website cookies (/ap/exchangetoken/cookies), so nothing has to be copied by hand.
+#
+# Flow and parameters follow the "external login" of the audible library (mkb79/Audible),
+# which registers as the Audible iOS app. The device then shows up in the Amazon account under
+# "Manage Content and Devices" → "Devices" (as "<first name>'s Audible for iPhone") and can be
+# removed there at any time; `amazon-logout` removes it too.
+
+DEVICE_FILE_NAME = "amazon_device.json"
+DEVICE_TYPE = "A2CZJZGLK2JJVM"
+DEVICE_APP = {
+    "app_name": "Audible",
+    "app_version": "3.56.2",
+    "software_version": "35602678",
+    "os_version": "15.0.0",
+    "device_model": "iPhone",
+}
+DEVICE_NAME = "%FIRST_NAME%%FIRST_NAME_POSSESSIVE_STRING%%DUPE_STRATEGY_1ST%Audible for iPhone"
+DEVICE_USER_AGENT = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+)
+# Amazon TLD → (country code of the sign-in page, marketplace id), from the audible library
+DEVICE_MARKETPLACES = {
+    "de": ("de", "AN7V1F1VY261K"),
+    "com": ("us", "AF2M0KC94RCEA"),
+    "co.uk": ("uk", "A2I9A3Q2GNFNGQ"),
+    "fr": ("fr", "A2728XDNODOQ8T"),
+    "it": ("it", "A2N7FU2W2BU2ZC"),
+    "es": ("es", "ALMIKO4SZCSAR"),
+    "ca": ("ca", "A2CQZ5RBY40XE"),
+}
+LOGIN_COMMAND = "docker exec -it immich-sync python3 /app/immich_sync.py amazon-login"
+_COOKIE_NAME_RE = re.compile(r"[A-Za-z0-9_.-]+")
+_AUTH_CODE_RE = re.compile(r"[A-Za-z0-9_-]{8,1024}")
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def _device_marketplace(tld: str) -> tuple[str, str]:
+    try:
+        return DEVICE_MARKETPLACES[tld]
+    except KeyError:
+        raise ConfigError(
+            f"device login is not available for amazon.{tld} "
+            f"(known: {', '.join(sorted(DEVICE_MARKETPLACES))}); use cookies"
+        ) from None
+
+
+def device_client_id(serial: str) -> str:
+    return (f"{serial}#{DEVICE_TYPE}").encode().hex()
+
+
+def device_login_url(tld: str, serial: str, code_verifier: str) -> str:
+    """Amazon sign-in page that ends on /ap/maplanding with an authorization code."""
+    country, marketplace = _device_marketplace(tld)
+    challenge = _b64url(hashlib.sha256(code_verifier.encode()).digest())
+    params = {
+        "openid.oa2.response_type": "code",
+        "openid.oa2.code_challenge_method": "S256",
+        "openid.oa2.code_challenge": challenge,
+        "openid.return_to": f"https://www.amazon.{tld}/ap/maplanding",
+        "openid.assoc_handle": f"amzn_audible_ios_{country}",
+        "openid.identity": "http://specs.openid.net/auth/2.0/identifier_select",
+        "pageId": "amzn_audible_ios",
+        "accountStatusPolicy": "P1",
+        "openid.claimed_id": "http://specs.openid.net/auth/2.0/identifier_select",
+        "openid.mode": "checkid_setup",
+        "openid.ns.oa2": "http://www.amazon.com/ap/ext/oauth/2",
+        "openid.oa2.client_id": f"device:{device_client_id(serial)}",
+        "openid.ns.pape": "http://specs.openid.net/extensions/pape/1.0",
+        "marketPlaceId": marketplace,
+        "openid.oa2.scope": "device_auth_access",
+        "forceMobileLayout": "true",
+        "openid.ns": "http://specs.openid.net/auth/2.0",
+        "openid.pape.max_auth_age": "0",
+    }
+    return f"https://www.amazon.{tld}/ap/signin?{urlencode(params)}"
+
+
+def parse_authorization_code(pasted: str, tld: str) -> str:
+    """Take the address Amazon ended on after sign-in (or just the code) and return the code."""
+    text = pasted.strip()
+    if "://" in text:
+        parts = urlsplit(text)
+        if parts.scheme != "https" or parts.netloc != f"www.amazon.{tld}" \
+                or parts.path != "/ap/maplanding":
+            raise ValueError(
+                f"expected the address https://www.amazon.{tld}/ap/maplanding?... "
+                "from the browser's address bar after signing in"
+            )
+        values = parse_qs(parts.query).get("openid.oa2.authorization_code") or []
+        if not values:
+            raise ValueError("the address contains no openid.oa2.authorization_code")
+        text = values[0]
+    if not _AUTH_CODE_RE.fullmatch(text):
+        raise ValueError("the authorization code has an unexpected format")
+    return text
+
+
+def _identity_error(text: str) -> str:
+    """Amazon's error code and message from an identity reply, never the whole body."""
+    try:
+        err = json.loads(text)["response"]["error"]
+        return f"{err.get('code')}: {err.get('message')}"[:300]
+    except (ValueError, KeyError, TypeError):
+        return text[:300]
+
+
+def _identity_call(url: str, *, json_body: dict | None = None, form: dict | None = None,
+                   headers: dict | None = None) -> dict:
+    """POST to Amazon's identity endpoints. A 3xx/4xx (except 429) means the login is not valid."""
+    if json_body is not None:
+        data, content_type = json.dumps(json_body).encode(), "application/json"
+    else:
+        data, content_type = urlencode(form or {}).encode(), "application/x-www-form-urlencoded"
+    all_headers = {"Content-Type": content_type, "Accept": "application/json",
+                   "User-Agent": DEVICE_USER_AGENT, **(headers or {})}
+    try:
+        body = _request(url, headers=all_headers, data=data, method="POST")
+    except HTTPError as e:
+        text = _identity_error(_error_body(e))
+        if e.code != 429 and 300 <= e.code < 500:
+            raise AmazonAuthError(e.code, text) from None
+        raise AmazonError(e.code, text) from None
+    try:
+        reply = json.loads(body) if body.strip() else {}
+    except ValueError:
+        raise AmazonError(200, f"unreadable reply from {urlsplit(url).path}") from None
+    return reply if isinstance(reply, dict) else {}
+
+
+def _cookie_dict(items) -> dict[str, str]:
+    """[{"Name": ..., "Value": ...}, ...] → {name: value}; every value is treated as a secret."""
+    cookies: dict[str, str] = {}
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        name, value = item.get("Name"), item.get("Value")
+        if not isinstance(name, str) or not isinstance(value, str):
+            continue
+        if not _COOKIE_NAME_RE.fullmatch(name) or any(ch in value for ch in "\r\n;") \
+                or not value.isprintable():
+            raise AmazonError(200, f"Amazon returned an unusable cookie ({name[:40]!r})")
+        cookies[name] = value
+        _SECRETS.add(value)
+    return cookies
+
+
+def register_device(tld: str, authorization_code: str, code_verifier: str, serial: str) -> dict:
+    """Register this sync as a device. Returns refresh token, device name and first cookies."""
+    body = {
+        "requested_token_type": ["bearer", "mac_dms", "website_cookies",
+                                 "store_authentication_cookie"],
+        "cookies": {"website_cookies": [], "domain": f".amazon.{tld}"},
+        "registration_data": {
+            "domain": "Device",
+            "app_version": DEVICE_APP["app_version"],
+            "device_serial": serial,
+            "device_type": DEVICE_TYPE,
+            "device_name": DEVICE_NAME,
+            "os_version": DEVICE_APP["os_version"],
+            "software_version": DEVICE_APP["software_version"],
+            "device_model": DEVICE_APP["device_model"],
+            "app_name": DEVICE_APP["app_name"],
+        },
+        "auth_data": {
+            "client_id": device_client_id(serial),
+            "authorization_code": authorization_code,
+            "code_verifier": code_verifier,
+            "code_algorithm": "SHA-256",
+            "client_domain": "DeviceLegacy",
+        },
+        "requested_extensions": ["device_info", "customer_info"],
+    }
+    reply = _identity_call(f"https://api.amazon.{tld}/auth/register", json_body=body)
+    response = reply.get("response") or {}
+    if "success" not in response:
+        raise AmazonAuthError(200, _identity_error(json.dumps(reply)))
+    success = response["success"] or {}
+    tokens = success.get("tokens") or {}
+    refresh_token = (tokens.get("bearer") or {}).get("refresh_token")
+    if not isinstance(refresh_token, str) or not refresh_token:
+        raise AmazonError(200, f"registration reply without refresh token (parts: {sorted(tokens)})")
+    _SECRETS.add(refresh_token)
+    info = (success.get("extensions") or {}).get("device_info") or {}
+    return {
+        "refresh_token": refresh_token,
+        "device_name": str(info.get("device_name") or "")[:100],
+        "cookies": _cookie_dict(tokens.get("website_cookies")),
+    }
+
+
+def exchange_cookies(tld: str, refresh_token: str) -> dict[str, str]:
+    """Trade the refresh token for a fresh set of amazon.<tld> website cookies."""
+    reply = _identity_call(
+        f"https://www.amazon.{tld}/ap/exchangetoken/cookies",
+        form={
+            "app_name": DEVICE_APP["app_name"],
+            "app_version": DEVICE_APP["app_version"],
+            "source_token": refresh_token,
+            "source_token_type": "refresh_token",
+            "requested_token_type": "auth_cookies",
+            "domain": f".amazon.{tld}",
+        },
+        headers={"x-amzn-identity-auth-domain": f"api.amazon.{tld}"},
+    )
+    jar = ((reply.get("response") or {}).get("tokens") or {}).get("cookies") or {}
+    cookies = _cookie_dict(jar.get(f".amazon.{tld}") if isinstance(jar, dict) else None)
+    if not cookies:
+        raise AmazonAuthError(200, f"Amazon returned no cookies for .amazon.{tld}")
+    return cookies
+
+
+def deregister_device(tld: str, refresh_token: str) -> None:
+    """Remove the device from the account (the refresh token stops working)."""
+    reply = _identity_call(
+        f"https://api.amazon.{tld}/auth/token",
+        form={
+            "app_name": DEVICE_APP["app_name"],
+            "app_version": DEVICE_APP["app_version"],
+            "source_token": refresh_token,
+            "source_token_type": "refresh_token",
+            "requested_token_type": "access_token",
+        },
+    )
+    access_token = reply.get("access_token")
+    if not isinstance(access_token, str) or not access_token:
+        raise AmazonError(200, "no access token to deregister with")
+    _SECRETS.add(access_token)
+    _identity_call(
+        f"https://api.amazon.{tld}/auth/deregister",
+        json_body={"deregister_all_existing_accounts": False},
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+
+
+def device_session_headers(cookies: dict[str, str], tld: str) -> dict[str, str]:
+    """Cookie and session headers for the Drive API from a set of website cookies."""
+    at_key = region_settings(tld)["at_key"]
+    if at_key not in cookies:
+        raise AmazonAuthError(200, f"Amazon returned no {at_key} cookie")
+    headers = {"Cookie": "; ".join(f"{k}={v}" for k, v in cookies.items())}
+    if cookies.get("session-id"):
+        headers["x-amzn-sessionid"] = cookies["session-id"]
+    return headers
+
+
+def load_device(path: Path) -> dict:
+    """Read the device file written by amazon-login. Raises ConfigError if it is unusable."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise ConfigError(f"device file {path} is unreadable ({e}); run amazon-login again") from None
+    if not isinstance(data, dict) or data.get("version") != 1 \
+            or not isinstance(data.get("refresh_token"), str) or not data["refresh_token"] \
+            or data.get("tld") not in DEVICE_MARKETPLACES:
+        raise ConfigError(f"device file {path} is incomplete; run amazon-login again")
+    base = data.get("base_cookies")
+    if not isinstance(base, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in base.items()):
+        data["base_cookies"] = {}
+    _SECRETS.add(data["refresh_token"])
+    _SECRETS.update(data["base_cookies"].values())
+    return data
+
+
+def save_device(path: Path, data: dict) -> None:
+    """Atomically write the device file (0600)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=".device-", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+
+def refresh_device_session() -> None:
+    """Start of a run in device mode: fresh website cookies from the refresh token."""
+    device = load_device(DEVICE_FILE)
+    cookies = {**device["base_cookies"], **exchange_cookies(AMAZON_TLD, device["refresh_token"])}
+    AP_HEADERS.pop("x-amzn-sessionid", None)
+    AP_HEADERS.update(device_session_headers(cookies, AMAZON_TLD))
+    log.info(f"Amazon session: {len(cookies)} fresh cookies from the device login "
+             f"({device.get('device_name') or 'device'}, registered {device.get('registered_at', '?')})")
+
+
+def _redact(text: str) -> str:
+    for secret in _SECRETS:
+        if len(secret) >= 4:
+            text = text.replace(secret, "***")
+    return text
+
+
+def amazon_login() -> int:
+    """Interactive: sign in once in a browser, register the device, save the refresh token."""
+    global AMAZON_DRIVE_URL, AP_HEADERS
+    try:
+        tld = region_settings(_env("AP_TLD", "de"))["tld"]
+        _device_marketplace(tld)
+        device_file = Path(_env("STATE_DIR", "/data")) / DEVICE_FILE_NAME
+        user_agent = _env("AP_USER_AGENT", DEFAULT_USER_AGENT)
+    except ConfigError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return EXIT_ERROR
+
+    serial = uuid.uuid4().hex.upper()
+    code_verifier = _b64url(os.urandom(32))
+    print(
+        "Amazon device login\n\n"
+        "1. Open this address in a browser (a private window is fine) and sign in with the\n"
+        "   Amazon account of the Echo Show, including the second factor if asked:\n\n"
+        f"{device_login_url(tld, serial, code_verifier)}\n\n"
+        f"2. Amazon then shows an error page (\"page not found\") at https://www.amazon.{tld}/ap/maplanding?...\n"
+        "   That is expected. Copy the complete address from the address bar.\n"
+        "3. Paste it below and press Enter. The input stays hidden. The code in it is valid for a few minutes.\n"
+    )
+    try:
+        pasted = getpass.getpass("Address after sign-in: ")
+        code = parse_authorization_code(pasted, tld)
+    except (ValueError, EOFError, KeyboardInterrupt) as e:
+        print(f"\nAborted: {e or 'no input'}", file=sys.stderr)
+        return EXIT_ERROR
+    _SECRETS.add(code)
+
+    try:
+        registration = register_device(tld, code, code_verifier, serial)
+    except AmazonError as e:
+        print(f"Registration failed (HTTP {e.code}): {_redact(e.body)}", file=sys.stderr)
+        return EXIT_AUTH
+    refresh_token = registration["refresh_token"]
+    name = registration["device_name"] or "Audible for iPhone"
+    print(f"Registered as device \"{name}\". Checking access to Amazon Photos...")
+
+    region = region_settings(tld)
+    base_cookies = {k: v for k, v in registration["cookies"].items()
+                    if k in ("session-id", region["ubid_key"])}
+    try:
+        cookies = {**base_cookies, **exchange_cookies(tld, refresh_token)}
+        AMAZON_DRIVE_URL = region["drive_url"]
+        AP_HEADERS = {"User-Agent": user_agent, **device_session_headers(cookies, tld)}
+        get_root_id()
+    except (AmazonError, KeyError, IndexError, TypeError, ValueError) as e:
+        print(f"Amazon Photos did not accept the new session: {_redact(str(e))}", file=sys.stderr)
+        try:
+            deregister_device(tld, refresh_token)
+            print("The device was removed from the account again. Nothing was saved.", file=sys.stderr)
+        except AmazonError as e2:
+            print(f"Could not remove the device ({_redact(str(e2))}). Remove \"{name}\" under "
+                  "Manage Content and Devices → Devices. Nothing was saved.", file=sys.stderr)
+        return EXIT_AUTH
+
+    previous = None
+    if device_file.exists():
+        try:
+            previous = load_device(device_file)
+        except ConfigError:
+            previous = None
+    save_device(device_file, {
+        "version": 1,
+        "tld": tld,
+        "device_serial": serial,
+        "device_name": name,
+        "registered_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "refresh_token": refresh_token,
+        "base_cookies": base_cookies,
+    })
+    print(f"Saved to {device_file}. From the next run on the sync signs in with it; the cookie "
+          "secrets (AP_SESSION_ID, AP_UBID_VALUE, AP_AT_VALUE) are no longer used.")
+    if previous and previous["refresh_token"] != refresh_token and previous["tld"] == tld:
+        try:
+            deregister_device(tld, previous["refresh_token"])
+            print(f"Removed the previous device \"{previous.get('device_name') or '?'}\" from the account.")
+        except AmazonError:
+            print(f"The previous device \"{previous.get('device_name') or '?'}\" could not be removed "
+                  "(probably gone already). If it is still listed under Manage Content and Devices "
+                  "→ Devices, remove it there.")
+    print("Start a run now with: docker restart immich-sync")
+    return EXIT_OK
+
+
+def amazon_logout() -> int:
+    """Remove the device from the Amazon account and delete the device file."""
+    try:
+        device_file = Path(_env("STATE_DIR", "/data")) / DEVICE_FILE_NAME
+        if not device_file.exists():
+            print(f"No device login ({device_file} does not exist).")
+            return EXIT_OK
+        device = load_device(device_file)
+    except ConfigError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return EXIT_ERROR
+    name = device.get("device_name") or "Audible for iPhone"
+    code = EXIT_OK
+    try:
+        deregister_device(device["tld"], device["refresh_token"])
+        print(f"Removed device \"{name}\" from the Amazon account.")
+    except AmazonError as e:
+        print(f"Could not remove the device ({_redact(str(e))}). Remove \"{name}\" under "
+              "Manage Content and Devices → Devices.", file=sys.stderr)
+        code = EXIT_AUTH
+    device_file.unlink()
+    print(f"Deleted {device_file}. The sync uses the cookie secrets again.")
+    return code
+
+
 # Immich API
 
 
@@ -943,6 +1384,8 @@ def run() -> int:
         log.error("No matching albums found. Check IMMICH_ALBUMS.")
         return EXIT_ERROR
 
+    if AUTH_MODE == "device":
+        refresh_device_session()
     root_id = get_root_id()
     log.info(f"Amazon Photos root node: {root_id}")
 
@@ -1141,7 +1584,14 @@ def delete_assets(state: dict, asset_ids: list[str]) -> tuple[int, int]:
     return total_finished, total_failed
 
 
-def main() -> int:
+def main(argv: list[str] | tuple = ()) -> int:
+    if list(argv) == ["amazon-login"]:
+        return amazon_login()
+    if list(argv) == ["amazon-logout"]:
+        return amazon_logout()
+    if argv:
+        print("Usage: immich_sync.py [amazon-login | amazon-logout]", file=sys.stderr)
+        return EXIT_ERROR
     try:
         _configure()
     except ConfigError as e:
@@ -1152,10 +1602,17 @@ def main() -> int:
     try:
         code = run()
     except AmazonAuthError as e:
-        log.error(
-            f"Amazon rejected the request (HTTP {e.code}): cookies expired or invalid. "
-            "Copy fresh cookies from the browser and restart. Run aborted."
-        )
+        if AUTH_MODE == "device":
+            log.error(
+                f"Amazon rejected the request (HTTP {e.code}): device login expired or removed "
+                f"({e.body[:200]}). Sign in again: {LOGIN_COMMAND}. Run aborted."
+            )
+        else:
+            log.error(
+                f"Amazon rejected the request (HTTP {e.code}): cookies expired or invalid. "
+                f"Copy fresh cookies from the browser, or switch to the device login "
+                f"({LOGIN_COMMAND}), and restart. Run aborted."
+            )
         code = EXIT_AUTH
     except FatalError as e:
         log.error(str(e))
@@ -1172,4 +1629,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))
