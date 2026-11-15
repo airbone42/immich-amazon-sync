@@ -3,3 +3,7 @@ data/
 secrets/
 __pycache__/
 *.pyc
+.env.*
+!.env.example
+data-rosa/
+.venv/

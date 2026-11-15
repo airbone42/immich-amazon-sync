@@ -57,6 +57,7 @@ class Backend:
         self.trashed = set()
         self.trash_rejects = set()  # nodes for which PATCH /trash fails with 400
         self.gzip_children = False  # answer PATCH .../children gzip-compressed, as amazon.de does
+        self.upload_fails = False   # force every upload to fail with 500
         self.calls = []  # (method, url, body)
         self._n = 0
 
@@ -134,6 +135,8 @@ class Backend:
         raise AssertionError(f"unexpected Immich path {path}")
 
     def upload(self, body):
+        if self.upload_fails:
+            raise HTTPError("upload", 500, "upload failed", {}, io.BytesIO(b"{}"))
         meta = json.loads(body.split(b"\r\n\r\n", 1)[1].split(b"\r\n", 1)[0])
         if meta["name"] in self.upload_conflict:
             raise HTTPError("u", 409, "conflict", {}, io.BytesIO(json.dumps(
@@ -275,7 +278,7 @@ class TestFullSync(SyncTestCase):
 
         self.assertEqual(self.run_sync(), immich_sync.EXIT_OK)
         state = self.state()
-        self.assertEqual(state["version"], 2)
+        self.assertEqual(state["version"], 3)
         self.assertEqual(set(state["synced"]), set(ids))
         album_id = state["album_node_id"]
         self.assertEqual(self.backend.nodes[album_id]["name"], "Echo Show")
@@ -391,7 +394,7 @@ class TestFullSync(SyncTestCase):
     def test_shared_node_is_not_trashed_while_still_used(self):
         album = self.backend.add_album("Echo", [aid(i) for i in range(1, 7)])
         self.backend.nodes["shared"] = {"id": "shared", "kind": "FILE", "status": "AVAILABLE"}
-        self.write_state({"version": 2, "album_node_id": None, "pending_album_add": [],
+        self.write_state({"version": 3, "album_node_id": None, "pending_album_add": [],
                           "synced": {aid(1): "shared", aid(2): "shared"}})
         self.run_sync()
         self.backend.albums[album]["assets"].pop(0)  # aid(1) leaves, aid(2) stays
@@ -662,6 +665,205 @@ class TestAuthAndSecrets(SyncTestCase):
         self.assertIn("ubid-custom=", immich_sync.AP_HEADERS["Cookie"])
         self.assertIn("at-main=", immich_sync.AP_HEADERS["Cookie"])
         self.assertEqual(immich_sync.AP_HEADERS["User-Agent"], "UA/1")
+
+
+class TestAmazonBatchLimit(SyncTestCase):
+    """Amazon rejects album-children PATCH value arrays longer than 25.
+
+    Regression: AMAZON_BATCH_SIZE was 50, so every album add/remove returned
+    HTTP 400 and fell back to one node per request (slow, log-noisy).
+    """
+
+    def test_batch_size_constant_matches_the_amazon_cap(self):
+        self.assertEqual(immich_sync.AMAZON_BATCH_SIZE, 25)
+
+    def test_no_album_patch_exceeds_the_cap(self):
+        ids = [aid(i) for i in range(1, 60)]
+        album = self.backend.add_album("Echo", ids)
+        self.assertEqual(self.run_sync(), immich_sync.EXIT_OK)
+
+        album_id = self.state()["album_node_id"]
+        patches = [
+            json.loads(data)
+            for method, url, data in self.backend.calls
+            if method == "PATCH" and url.endswith("/children")
+        ]
+        self.assertGreater(len(patches), 1, "expected several batched add calls")
+        for body in patches:
+            self.assertLessEqual(
+                len(body["value"]), 25,
+                f"Amazon rejects value arrays >25 (got {len(body['value'])})",
+            )
+        self.assertEqual(self.backend.album_children[album_id], set(self.state()["synced"].values()))
+
+    def test_batches_are_not_split_when_at_the_cap(self):
+        ids = [aid(i) for i in range(1, 26)]  # exactly 25
+        album = self.backend.add_album("Echo", ids)
+        self.assertEqual(self.run_sync(), immich_sync.EXIT_OK)
+        patches = [
+            json.loads(data)
+            for method, url, data in self.backend.calls
+            if method == "PATCH" and url.endswith("/children")
+        ]
+        self.assertEqual(len(patches), 1)
+        self.assertEqual(len(patches[0]["value"]), 25)
+        self.assertEqual(self.backend.album_children[self.state()["album_node_id"]],
+                         set(self.state()["synced"].values()))
+
+
+class TestAccumulatePruning(SyncTestCase):
+    def test_accumulate_keeps_assets_that_leave_immich(self):
+        ids = [aid(i) for i in range(1, 7)]
+        album = self.backend.add_album("Echo", ids)
+        self.assertEqual(self.run_sync(), immich_sync.EXIT_OK)
+        state_before = self.state()
+        retired_id = ids[0]
+        node_id = state_before["synced"][retired_id]
+        last_seen = state_before["last_seen"][retired_id]
+        album_node = state_before["album_node_id"]
+        self.backend.calls.clear()
+
+        self.backend.albums[album]["assets"].pop(0)
+        self.assertEqual(self.run_sync(SYNC_MODE="accumulate"), immich_sync.EXIT_OK)
+
+        state = self.state()
+        self.assertEqual(state["synced"][retired_id], node_id)
+        self.assertEqual(state["last_seen"][retired_id], last_seen)
+        self.assertIn(node_id, self.backend.album_children[album_node])
+        self.assertEqual(self.backend.trashed, set())
+        self.assertEqual(self.backend.amazon_writes(), [])
+
+    def test_max_count_prunes_oldest_retired_to_total_limit(self):
+        ids = [aid(i) for i in range(1, 9)]
+        album = self.backend.add_album("Echo", ids)
+        self.assertEqual(self.run_sync(), immich_sync.EXIT_OK)
+        state = self.state()
+        retired = ids[:2]
+        nodes = {state["synced"][asset_id] for asset_id in retired}
+        self.backend.albums[album]["assets"] = self.backend.albums[album]["assets"][2:]
+
+        self.assertEqual(
+            self.run_sync(SYNC_MODE="accumulate", PRUNE_MODE="max_count",
+                          PRUNE_MAX_COUNT="6", MAX_DELETE_FRACTION="0.5"),
+            immich_sync.EXIT_OK,
+        )
+        state = self.state()
+        self.assertEqual(len(state["synced"]), 6)
+        self.assertFalse(set(retired) & set(state["synced"]))
+        self.assertEqual(self.backend.trashed, nodes)
+
+    def test_max_count_never_prunes_assets_still_in_source(self):
+        ids = [aid(i) for i in range(1, 6)]
+        self.backend.add_album("Echo", ids)
+        self.assertEqual(self.run_sync(), immich_sync.EXIT_OK)
+
+        self.assertEqual(
+            self.run_sync(SYNC_MODE="accumulate", PRUNE_MODE="max_count",
+                          PRUNE_MAX_COUNT="3"),
+            immich_sync.EXIT_OK,
+        )
+        self.assertEqual(set(self.state()["synced"]), set(ids))
+        self.assertEqual(self.backend.trashed, set())
+        self.assertIn("5 asset(s) are still in Immich albums", self.output)
+
+    def test_keep_recent_prunes_only_retired_assets_past_cutoff(self):
+        from datetime import datetime, timedelta, timezone
+
+        ids = [aid(i) for i in range(1, 5)]
+        album = self.backend.add_album("Echo", ids)
+        self.assertEqual(self.run_sync(), immich_sync.EXIT_OK)
+        state = self.state()
+        retired_id = ids[0]
+        retired_node = state["synced"][retired_id]
+        self.backend.albums[album]["assets"].pop(0)
+        state["last_seen"][retired_id] = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
+        self.write_state(state)
+
+        self.assertEqual(
+            self.run_sync(SYNC_MODE="accumulate", PRUNE_MODE="keep_recent",
+                          PRUNE_KEEP_RECENT_DAYS="30", MAX_DELETE_FRACTION="1"),
+            immich_sync.EXIT_OK,
+        )
+        self.assertNotIn(retired_id, self.state()["synced"])
+        self.assertIn(retired_node, self.backend.trashed)
+
+    def test_both_prune_policy_uses_union_of_count_and_age(self):
+        from datetime import datetime, timedelta, timezone
+
+        ids = [aid(i) for i in range(1, 7)]
+        album = self.backend.add_album("Echo", ids)
+        self.assertEqual(self.run_sync(), immich_sync.EXIT_OK)
+        state = self.state()
+        retired_ids = ids[:2]
+        old_node = state["synced"][retired_ids[0]]
+        self.backend.albums[album]["assets"] = self.backend.albums[album]["assets"][2:]
+        old = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
+        recent = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        state["last_seen"][retired_ids[0]] = old
+        state["last_seen"][retired_ids[1]] = recent
+        self.write_state(state)
+
+        self.assertEqual(
+            self.run_sync(SYNC_MODE="accumulate", PRUNE_MODE="both",
+                          PRUNE_MAX_COUNT="6", PRUNE_KEEP_RECENT_DAYS="30",
+                          MAX_DELETE_FRACTION="1"),
+            immich_sync.EXIT_OK,
+        )
+        self.assertNotIn(retired_ids[0], self.state()["synced"])
+        self.assertIn(retired_ids[1], self.state()["synced"])
+        self.assertEqual(self.backend.trashed, {old_node})
+
+    def test_accumulate_prune_is_still_protected_by_deletion_brake(self):
+        ids = [aid(i) for i in range(1, 11)]
+        album = self.backend.add_album("Echo", ids)
+        self.assertEqual(self.run_sync(), immich_sync.EXIT_OK)
+        self.backend.albums[album]["assets"] = self.backend.albums[album]["assets"][3:]
+
+        self.assertEqual(
+            self.run_sync(SYNC_MODE="accumulate", PRUNE_MODE="max_count",
+                          PRUNE_MAX_COUNT="7"),
+            immich_sync.EXIT_DELETE_BLOCKED,
+        )
+        self.assertEqual(len(self.state()["synced"]), 10)
+        self.assertEqual(self.backend.trashed, set())
+        self.assertIn("Deletion brake", self.output)
+
+    def test_accumulate_prune_is_blocked_when_sync_has_errors(self):
+        from datetime import datetime, timedelta, timezone
+
+        ids = [aid(i) for i in range(1, 5)]
+        album = self.backend.add_album("Echo", ids)
+        self.assertEqual(self.run_sync(), immich_sync.EXIT_OK)
+        state = self.state()
+        retired_id = ids[0]
+        retired_node = state["synced"][retired_id]
+        self.backend.albums[album]["assets"].pop(0)
+        new_id = aid(5)
+        self.backend.albums[album]["assets"].append(self.backend.make_asset(new_id))
+        state["last_seen"][retired_id] = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
+        self.write_state(state)
+        self.backend.upload_fails = True
+
+        self.assertEqual(
+            self.run_sync(SYNC_MODE="accumulate", PRUNE_MODE="keep_recent",
+                          PRUNE_KEEP_RECENT_DAYS="30", MAX_DELETE_FRACTION="1"),
+            immich_sync.EXIT_DELETE_BLOCKED,
+        )
+        self.assertIn(retired_id, self.state()["synced"])
+        self.assertIn(new_id, {a["id"] for a in self.backend.albums[album]["assets"]})
+        self.assertNotIn(retired_node, self.backend.trashed)
+        self.assertIn("sync error(s) occurred", self.output)
+
+    def test_prune_configuration_requires_valid_accumulate_policy(self):
+        for env in (
+            {"SYNC_MODE": "unknown"},
+            {"SYNC_MODE": "mirror", "PRUNE_MODE": "max_count", "PRUNE_MAX_COUNT": "5"},
+            {"SYNC_MODE": "accumulate", "PRUNE_MODE": "max_count"},
+            {"SYNC_MODE": "accumulate", "PRUNE_MODE": "keep_recent"},
+        ):
+            with self.subTest(env=env):
+                self.assertEqual(self.run_sync(**env), immich_sync.EXIT_ERROR)
+                self.assertIn("Error:", self.output)
 
 
 if __name__ == "__main__":

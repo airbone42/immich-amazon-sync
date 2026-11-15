@@ -23,7 +23,7 @@ class TestState(unittest.TestCase):
 
                 state = load_state()
                 self.assertEqual(state["synced"], {})
-                self.assertEqual(state["version"], 2)
+                self.assertEqual(state["version"], 3)
 
                 state["synced"] = {"asset1": "node1", "asset2": "node2"}
                 state["album_node_id"] = "album1"
@@ -46,7 +46,7 @@ class TestState(unittest.TestCase):
                 from immich_sync import load_state
 
                 state = load_state()
-                self.assertEqual(state["version"], 2)
+                self.assertEqual(state["version"], 3)
                 self.assertEqual(state["synced"], {"a1": "n1", "a2": "n2"})
                 self.assertIsNone(state["album_node_id"])
                 self.assertEqual(state["pending_album_add"], [])
